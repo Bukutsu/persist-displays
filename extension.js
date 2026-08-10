@@ -4,7 +4,13 @@ import Meta from 'gi://Meta';
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 
-import { normalizePrimary, profileMatchesMonitor } from './logic.js';
+import {
+    monitorApplyProperties,
+    normalizeLayout,
+    normalizePrimary,
+    profileMatchesMonitor,
+    scaleSupported,
+} from './logic.js';
 
 const DisplayConfigIface = `
 <node>
@@ -239,10 +245,24 @@ export default class PersistDisplaysExtension extends Extension {
             this._snapshotInFlight = false;
             if (snapshotGeneration !== this._snapshotGeneration)
                 return;
-            if (!this._enabled || this._suppressSnapshot || error || !result)
+            if (!this._enabled || this._suppressSnapshot) {
+                this._snapshotAgain = false;
                 return;
+            }
+            if (error || !result) {
+                if (this._snapshotAgain) {
+                    this._snapshotAgain = false;
+                    this._queueSnapshot();
+                }
+                return;
+            }
 
-            const [, monitors, logicalMonitors] = result;
+            const [, monitors, logicalMonitors, properties] = result;
+            const mirrored = logicalMonitors.some(logicalMonitor =>
+                logicalMonitor[5].length > 1);
+            const layoutMode = unpack(properties?.['layout-mode']);
+            if (!mirrored && [1, 2].includes(layoutMode))
+                this._memory.layout_mode = layoutMode;
             const monitorMap = new Map(monitors.map(monitor => [
                 monitor[0][0],
                 monitor,
@@ -250,6 +270,8 @@ export default class PersistDisplaysExtension extends Extension {
 
             for (const logicalMonitor of logicalMonitors) {
                 const [x, y, scale, transform, primary, monitorSpecs] = logicalMonitor;
+                if (monitorSpecs.length > 1)
+                    continue;
 
                 for (const monitorSpec of monitorSpecs) {
                     const connector = monitorSpec[0];
@@ -308,20 +330,13 @@ export default class PersistDisplaysExtension extends Extension {
         return monitor[1].find(mode => mode[0] === modeId) || fallback;
     }
 
-    _scaleSupported(mode, scale) {
-        if (!Number.isFinite(scale) || scale <= 0)
-            return false;
-
-        const supportedScales = mode && unpack(mode[5]);
-        if (!supportedScales || supportedScales.length === 0)
-            return true;
-
-        return supportedScales.some(value => Math.abs(value - scale) < 0.01);
+    _scaleSupported(mode, scale, layoutMode) {
+        return scaleSupported(mode && unpack(mode[5]), scale, layoutMode);
     }
 
-    _chooseScale(entries, currentScale) {
+    _chooseScale(entries, currentScale, layoutMode) {
         const supports = scale => entries.every(entry =>
-            this._scaleSupported(entry.selectedMode, scale));
+            this._scaleSupported(entry.selectedMode, scale, layoutMode));
         const saved = entries.find(entry =>
             entry.saved && hasOwn(entry.saved, 'scale'));
         const preferredMode = entries.find(entry => entry.selectedMode)?.selectedMode;
@@ -364,7 +379,7 @@ export default class PersistDisplaysExtension extends Extension {
                 return;
             }
 
-            const [serial, monitors, logicalMonitors] = result;
+            const [serial, monitors, logicalMonitors, properties] = result;
             if (!logicalMonitors.length) {
                 finish();
                 return;
@@ -378,8 +393,19 @@ export default class PersistDisplaysExtension extends Extension {
                 configType === Meta.MonitorSwitchConfigType.ALL_LINEAR ||
                 configType === Meta.MonitorSwitchConfigType.EXTERNAL
             ) && logicalMonitors.length > 1;
+            const currentLayoutMode = unpack(properties?.['layout-mode']);
+            const supportsLayoutMode = unpack(
+                properties?.['supports-changing-layout-mode']
+            ) === true;
+            const savedLayoutMode = this._memory.layout_mode;
+            const layoutMode = supportsLayoutMode && [1, 2].includes(savedLayoutMode)
+                ? savedLayoutMode
+                : currentLayoutMode;
+            const globalScaleRequired = unpack(
+                properties?.['global-scale-required']
+            ) === true;
             const entries = [];
-            let changed = false;
+            let changed = layoutMode !== currentLayoutMode;
 
             for (const logicalMonitor of logicalMonitors) {
                 const [x, y, scale, transform, primary, monitorSpecs] = logicalMonitor;
@@ -419,7 +445,11 @@ export default class PersistDisplaysExtension extends Extension {
                         saved: profile,
                         selectedMode,
                     });
-                    configuredMonitors.push([connector, selectedModeId, {}]);
+                    configuredMonitors.push([
+                        connector,
+                        selectedModeId,
+                        monitorApplyProperties(monitor?.[2]),
+                    ]);
                 }
 
                 let nextX = x;
@@ -437,7 +467,11 @@ export default class PersistDisplaysExtension extends Extension {
                         nextPrimary = savedLayout.saved.primary;
                 }
 
-                const nextScale = this._chooseScale(monitorEntries, scale);
+                const nextScale = this._chooseScale(
+                    monitorEntries,
+                    scale,
+                    layoutMode
+                );
                 const nextTransform = this._chooseTransform(monitorEntries, transform);
                 if (Math.abs(nextScale - scale) >= 0.01 ||
                     nextTransform !== transform ||
@@ -451,8 +485,26 @@ export default class PersistDisplaysExtension extends Extension {
                     scale: nextScale,
                     transform: nextTransform,
                     primary: nextPrimary,
+                    mode: monitorEntries[0].selectedMode,
+                    modes: monitorEntries.map(entry => entry.selectedMode),
                     monitors: configuredMonitors,
                 });
+            }
+
+            if (globalScaleRequired) {
+                const candidates = [...entries.map(entry => entry.scale), 1.0];
+                const globalScale = candidates.find(scale => entries.every(entry =>
+                    entry.modes.every(mode =>
+                        this._scaleSupported(mode, scale, layoutMode))));
+                if (globalScale === undefined) {
+                    finish();
+                    return;
+                }
+                for (const entry of entries) {
+                    if (Math.abs(entry.scale - globalScale) >= 0.01)
+                        changed = true;
+                    entry.scale = globalScale;
+                }
             }
 
             if (!changed) {
@@ -460,24 +512,36 @@ export default class PersistDisplaysExtension extends Extension {
                 return;
             }
 
-            const minX = Math.min(...entries.map(entry => entry.x));
-            const minY = Math.min(...entries.map(entry => entry.y));
+            const positions = normalizeLayout(entries, layoutMode);
             const primary = normalizePrimary(entries.map(entry => entry.primary));
             const newLogicalMonitors = entries.map((entry, index) => [
-                entry.x - minX,
-                entry.y - minY,
+                positions[index].x,
+                positions[index].y,
                 entry.scale,
                 entry.transform,
                 primary[index],
                 entry.monitors,
             ]);
 
+            const applyProperties = {};
+            if (supportsLayoutMode && [1, 2].includes(layoutMode))
+                applyProperties['layout-mode'] = new GLib.Variant('u', layoutMode);
+            const monitorsForLease = monitors
+                .filter(monitor => unpack(monitor[2]?.['is-for-lease']) === true)
+                .map(monitor => monitor[0]);
+            if (monitorsForLease.length > 0) {
+                applyProperties['monitors-for-lease'] = new GLib.Variant(
+                    'a(ssss)',
+                    monitorsForLease
+                );
+            }
+
             try {
                 proxy.ApplyMonitorsConfigRemote(
                     serial,
                     TEMPORARY_CONFIG,
                     newLogicalMonitors,
-                    {},
+                    applyProperties,
                     (_result, applyError) => {
                         if (applyError)
                             console.error('[PersistDisplays] ApplyMonitorsConfig error:', applyError);

@@ -15,10 +15,13 @@ GNOME rebuilds the layout when the switcher changes modes. This extension record
 ```bash
 mkdir -p ~/.local/share/gnome-shell/extensions/
 ln -s ~/Projects/persist-displays ~/.local/share/gnome-shell/extensions/persist-displays@bukutsu.github.io
-gnome-extensions enable persist-displays@bukutsu.github.io
 ```
 
-Log out and back in after creating the symlink so GNOME Shell finds the extension.
+Log out and back in so GNOME Shell discovers the extension, then enable it:
+
+```bash
+gnome-extensions enable persist-displays@bukutsu.github.io
+```
 
 ## Test
 
