@@ -4,6 +4,8 @@ import Meta from 'gi://Meta';
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 
+import { normalizePrimary, profileMatchesMonitor } from './logic.js';
+
 const DisplayConfigIface = `
 <node>
   <interface name="org.gnome.Mutter.DisplayConfig">
@@ -26,8 +28,6 @@ const DisplayConfigIface = `
 const DisplayConfigProxy = Gio.DBusProxy.makeProxyWrapper(DisplayConfigIface);
 const TEMPORARY_CONFIG = 1;
 
-let originalFinish = null;
-
 function unpack(value) {
     return value && typeof value.unpack === 'function' ? value.unpack() : value;
 }
@@ -39,6 +39,8 @@ function hasOwn(object, property) {
 export default class PersistDisplaysExtension extends Extension {
     enable() {
         this._enabled = true;
+        this._generation = (this._generation ?? 0) + 1;
+        const generation = this._generation;
         this._configFile = GLib.build_filenamev([
             GLib.get_user_config_dir(),
             'persist-displays.json',
@@ -46,6 +48,14 @@ export default class PersistDisplaysExtension extends Extension {
         this._memory = this._loadMemory();
         this._suppressSnapshot = false;
         this._restoreSourceId = 0;
+        this._restoreInFlight = false;
+        this._restoreGeneration = 0;
+        this._pendingRestoreType = null;
+        this._snapshotSourceId = 0;
+        this._snapshotInFlight = false;
+        this._snapshotAgain = false;
+        this._snapshotGeneration = 0;
+        this._ignoreSnapshotSourceId = 0;
 
         this._proxy = null;
         new DisplayConfigProxy(
@@ -53,7 +63,7 @@ export default class PersistDisplaysExtension extends Extension {
             'org.gnome.Mutter.DisplayConfig',
             '/org/gnome/Mutter/DisplayConfig',
             (proxy, error) => {
-                if (!this._enabled)
+                if (!this._enabled || generation !== this._generation)
                     return;
                 if (error) {
                     console.error('[PersistDisplays] Failed to connect to DisplayConfig:', error);
@@ -63,17 +73,22 @@ export default class PersistDisplaysExtension extends Extension {
                 this._proxy = proxy;
                 this._signalId = proxy.connectSignal('MonitorsChanged', () => {
                     if (!this._suppressSnapshot)
-                        this._snapshotActiveMonitors();
+                        this._queueSnapshot();
                 });
-                this._snapshotActiveMonitors();
+                this._queueSnapshot();
             }
         );
 
-        if (originalFinish === null)
-            originalFinish = SwitchMonitor.SwitchMonitorPopup.prototype._finish;
-
+        const prototype = SwitchMonitor.SwitchMonitorPopup.prototype;
+        this._originalFinish = prototype._finish;
+        const originalFinish = this._originalFinish;
         const extension = this;
-        SwitchMonitor.SwitchMonitorPopup.prototype._finish = function () {
+        this._finishWrapper = function () {
+            if (!extension._enabled) {
+                originalFinish.call(this);
+                return;
+            }
+
             const item = this._items[this._selectedIndex];
             const configType = item && item.configType;
 
@@ -90,8 +105,11 @@ export default class PersistDisplaysExtension extends Extension {
                 return;
             }
 
+            if (configType === Meta.MonitorSwitchConfigType.ALL_MIRROR)
+                extension._ignoreNextSnapshot();
             originalFinish.call(this);
         };
+        prototype._finish = this._finishWrapper;
     }
 
     _shouldRestore(configType) {
@@ -103,15 +121,62 @@ export default class PersistDisplaysExtension extends Extension {
             configType === Meta.MonitorSwitchConfigType.EXTERNAL;
     }
 
-    _queueRestore(configType) {
-        if (this._restoreSourceId)
+    _ignoreNextSnapshot() {
+        if (this._ignoreSnapshotSourceId)
+            GLib.source_remove(this._ignoreSnapshotSourceId);
+        if (this._snapshotSourceId) {
+            GLib.source_remove(this._snapshotSourceId);
+            this._snapshotSourceId = 0;
+        }
+        if (this._restoreSourceId) {
             GLib.source_remove(this._restoreSourceId);
+            this._restoreSourceId = 0;
+        }
 
+        this._suppressSnapshot = true;
+        this._pendingRestoreType = null;
+        this._restoreGeneration++;
+        this._snapshotAgain = false;
+        this._snapshotGeneration++;
+        this._ignoreSnapshotSourceId = GLib.timeout_add(
+            GLib.PRIORITY_DEFAULT,
+            2000,
+            () => {
+                this._ignoreSnapshotSourceId = 0;
+                this._suppressSnapshot = false;
+                return GLib.SOURCE_REMOVE;
+            }
+        );
+    }
+
+    _queueRestore(configType) {
+        if (this._ignoreSnapshotSourceId) {
+            GLib.source_remove(this._ignoreSnapshotSourceId);
+            this._ignoreSnapshotSourceId = 0;
+        }
+
+        this._pendingRestoreType = configType;
+        this._restoreGeneration++;
+        if (this._restoreSourceId || this._restoreInFlight)
+            return;
+
+        const generation = this._generation;
         this._restoreSourceId = GLib.idle_add(GLib.PRIORITY_LOW, () => {
             this._restoreSourceId = 0;
-            this._applyPersistedConfig(configType, () => {
-                this._suppressSnapshot = false;
-            });
+            const pendingType = this._pendingRestoreType;
+            const restoreGeneration = this._restoreGeneration;
+            this._pendingRestoreType = null;
+            this._restoreInFlight = true;
+            this._applyPersistedConfig(pendingType, () => {
+                if (generation !== this._generation)
+                    return;
+
+                this._restoreInFlight = false;
+                if (this._pendingRestoreType !== null)
+                    this._queueRestore(this._pendingRestoreType);
+                else if (restoreGeneration === this._restoreGeneration)
+                    this._suppressSnapshot = false;
+            }, restoreGeneration);
             return GLib.SOURCE_REMOVE;
         });
     }
@@ -141,14 +206,40 @@ export default class PersistDisplaysExtension extends Extension {
         }
     }
 
+    _queueSnapshot() {
+        if (!this._enabled || this._suppressSnapshot || this._snapshotSourceId)
+            return;
+        if (this._snapshotInFlight) {
+            this._snapshotAgain = true;
+            return;
+        }
+
+        this._snapshotSourceId = GLib.idle_add(GLib.PRIORITY_LOW, () => {
+            this._snapshotSourceId = 0;
+            this._snapshotActiveMonitors();
+            return GLib.SOURCE_REMOVE;
+        });
+    }
+
     _snapshotActiveMonitors() {
         const proxy = this._proxy;
         if (!this._enabled || !proxy || this._suppressSnapshot)
             return;
+        if (this._snapshotInFlight) {
+            this._snapshotAgain = true;
+            return;
+        }
 
+        this._snapshotInFlight = true;
+        const snapshotGeneration = this._snapshotGeneration;
         proxy.GetCurrentStateRemote((result, error) => {
-            if (!this._enabled || proxy !== this._proxy ||
-                this._suppressSnapshot || error || !result)
+            if (proxy !== this._proxy)
+                return;
+
+            this._snapshotInFlight = false;
+            if (snapshotGeneration !== this._snapshotGeneration)
+                return;
+            if (!this._enabled || this._suppressSnapshot || error || !result)
                 return;
 
             const [, monitors, logicalMonitors] = result;
@@ -162,14 +253,23 @@ export default class PersistDisplaysExtension extends Extension {
 
                 for (const monitorSpec of monitorSpecs) {
                     const connector = monitorSpec[0];
+                    const monitor = monitorMap.get(connector);
                     const existing = this._memory[connector];
                     const profile = existing && typeof existing === 'object' &&
-                        !Array.isArray(existing) ? existing : {};
+                        !Array.isArray(existing) &&
+                        profileMatchesMonitor(existing, monitor?.[0])
+                        ? existing
+                        : {};
 
                     profile.scale = scale;
                     profile.transform = transform;
 
-                    const monitor = monitorMap.get(connector);
+                    if (monitor) {
+                        const [spec] = monitor;
+                        profile.vendor = spec[1];
+                        profile.product = spec[2];
+                        profile.serial = spec[3];
+                    }
                     const currentMode = monitor && monitor[1].find(mode =>
                         unpack(mode[6]?.['is-current']) === true);
                     if (currentMode)
@@ -186,6 +286,10 @@ export default class PersistDisplaysExtension extends Extension {
             }
 
             this._saveMemory();
+            if (this._snapshotAgain) {
+                this._snapshotAgain = false;
+                this._queueSnapshot();
+            }
         });
     }
 
@@ -241,7 +345,7 @@ export default class PersistDisplaysExtension extends Extension {
             : currentTransform;
     }
 
-    _applyPersistedConfig(configType, done) {
+    _applyPersistedConfig(configType, done, restoreGeneration) {
         const finish = () => {
             if (done)
                 done();
@@ -254,7 +358,8 @@ export default class PersistDisplaysExtension extends Extension {
         }
 
         proxy.GetCurrentStateRemote((result, error) => {
-            if (!this._enabled || proxy !== this._proxy || error || !result) {
+            if (!this._enabled || proxy !== this._proxy ||
+                restoreGeneration !== this._restoreGeneration || error || !result) {
                 finish();
                 return;
             }
@@ -269,8 +374,10 @@ export default class PersistDisplaysExtension extends Extension {
                 monitor[0][0],
                 monitor,
             ]));
-            const restoreLayout = configType === Meta.MonitorSwitchConfigType.ALL_LINEAR &&
-                logicalMonitors.length > 1;
+            const restoreLayout = (
+                configType === Meta.MonitorSwitchConfigType.ALL_LINEAR ||
+                configType === Meta.MonitorSwitchConfigType.EXTERNAL
+            ) && logicalMonitors.length > 1;
             const entries = [];
             let changed = false;
 
@@ -282,9 +389,11 @@ export default class PersistDisplaysExtension extends Extension {
                 for (const monitorSpec of monitorSpecs) {
                     const connector = monitorSpec[0];
                     const saved = this._memory[connector];
-                    const profile = saved && typeof saved === 'object' &&
-                        !Array.isArray(saved) ? saved : null;
                     const monitor = monitorMap.get(connector);
+                    const profile = saved && typeof saved === 'object' &&
+                        !Array.isArray(saved) && profileMatchesMonitor(saved, monitor?.[0])
+                        ? saved
+                        : null;
                     const currentMode = this._currentMode(monitor);
                     const currentModeId = currentMode ? currentMode[0] : '';
                     const savedModeId = profile && profile.mode_id;
@@ -353,13 +462,13 @@ export default class PersistDisplaysExtension extends Extension {
 
             const minX = Math.min(...entries.map(entry => entry.x));
             const minY = Math.min(...entries.map(entry => entry.y));
-            const hasPrimary = entries.some(entry => entry.primary);
+            const primary = normalizePrimary(entries.map(entry => entry.primary));
             const newLogicalMonitors = entries.map((entry, index) => [
                 entry.x - minX,
                 entry.y - minY,
                 entry.scale,
                 entry.transform,
-                hasPrimary ? entry.primary : index === 0,
+                primary[index],
                 entry.monitors,
             ]);
 
@@ -384,16 +493,23 @@ export default class PersistDisplaysExtension extends Extension {
 
     disable() {
         this._enabled = false;
+        this._generation++;
+        this._restoreGeneration++;
 
-        if (this._restoreSourceId) {
-            GLib.source_remove(this._restoreSourceId);
-            this._restoreSourceId = 0;
+        for (const property of [
+            '_restoreSourceId',
+            '_snapshotSourceId',
+            '_ignoreSnapshotSourceId',
+        ]) {
+            if (this[property]) {
+                GLib.source_remove(this[property]);
+                this[property] = 0;
+            }
         }
 
-        if (originalFinish) {
-            SwitchMonitor.SwitchMonitorPopup.prototype._finish = originalFinish;
-            originalFinish = null;
-        }
+        const prototype = SwitchMonitor.SwitchMonitorPopup.prototype;
+        if (prototype._finish === this._finishWrapper)
+            prototype._finish = this._originalFinish;
 
         if (this._signalId && this._proxy) {
             this._proxy.disconnectSignal(this._signalId);
@@ -401,6 +517,14 @@ export default class PersistDisplaysExtension extends Extension {
         }
 
         this._proxy = null;
+        this._memory = null;
+        this._restoreInFlight = false;
+        this._pendingRestoreType = null;
+        this._snapshotInFlight = false;
+        this._snapshotAgain = false;
+        this._snapshotGeneration++;
         this._suppressSnapshot = false;
+        this._finishWrapper = null;
+        this._originalFinish = null;
     }
 }

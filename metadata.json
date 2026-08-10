@@ -3,11 +3,6 @@
   "name": "Persist Displays",
   "description": "Remembers monitor modes, scaling, rotation, and layout when using GNOME's Super+P display switcher.",
   "shell-version": [
-    "45",
-    "46",
-    "47",
-    "48",
-    "49",
     "50"
   ],
   "url": "https://github.com/Bukutsu/persist-displays"
