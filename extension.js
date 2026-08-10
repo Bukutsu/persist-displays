@@ -47,17 +47,27 @@ export default class PersistDisplaysExtension extends Extension {
         this._suppressSnapshot = false;
         this._restoreSourceId = 0;
 
-        this._proxy = new DisplayConfigProxy(
+        this._proxy = null;
+        new DisplayConfigProxy(
             Gio.DBus.session,
             'org.gnome.Mutter.DisplayConfig',
-            '/org/gnome/Mutter/DisplayConfig'
-        );
+            '/org/gnome/Mutter/DisplayConfig',
+            (proxy, error) => {
+                if (!this._enabled)
+                    return;
+                if (error) {
+                    console.error('[PersistDisplays] Failed to connect to DisplayConfig:', error);
+                    return;
+                }
 
-        this._signalId = this._proxy.connectSignal('MonitorsChanged', () => {
-            if (!this._suppressSnapshot)
+                this._proxy = proxy;
+                this._signalId = proxy.connectSignal('MonitorsChanged', () => {
+                    if (!this._suppressSnapshot)
+                        this._snapshotActiveMonitors();
+                });
                 this._snapshotActiveMonitors();
-        });
-        this._snapshotActiveMonitors();
+            }
+        );
 
         if (originalFinish === null)
             originalFinish = SwitchMonitor.SwitchMonitorPopup.prototype._finish;
