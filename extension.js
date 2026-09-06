@@ -5,9 +5,11 @@ import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 
 import {
+    hasMultiplePrimaries,
     monitorApplyProperties,
     normalizeLayout,
     normalizePrimary,
+    primaryMonitorConnector,
     profileMatchesMonitor,
     scaleSupported,
 } from './logic.js';
@@ -268,8 +270,11 @@ export default class PersistDisplaysExtension extends Extension {
                 monitor,
             ]));
 
-            for (const logicalMonitor of logicalMonitors) {
-                const [x, y, scale, transform, primary, monitorSpecs] = logicalMonitor;
+            const primaries = normalizePrimary(logicalMonitors.map(lm => Boolean(lm[4])));
+            for (let i = 0; i < logicalMonitors.length; i++) {
+                const logicalMonitor = logicalMonitors[i];
+                const [x, y, scale, transform, , monitorSpecs] = logicalMonitor;
+                const primary = primaries[i];
                 if (monitorSpecs.length > 1)
                     continue;
 
@@ -366,6 +371,7 @@ export default class PersistDisplaysExtension extends Extension {
                 done();
         };
         const proxy = this._proxy;
+        const generation = this._generation;
 
         if (!this._enabled || !proxy) {
             finish();
@@ -374,6 +380,7 @@ export default class PersistDisplaysExtension extends Extension {
 
         proxy.GetCurrentStateRemote((result, error) => {
             if (!this._enabled || proxy !== this._proxy ||
+                generation !== this._generation ||
                 restoreGeneration !== this._restoreGeneration || error || !result) {
                 finish();
                 return;
@@ -536,21 +543,87 @@ export default class PersistDisplaysExtension extends Extension {
                 );
             }
 
-            try {
-                proxy.ApplyMonitorsConfigRemote(
-                    serial,
-                    TEMPORARY_CONFIG,
-                    newLogicalMonitors,
-                    applyProperties,
-                    (_result, applyError) => {
-                        if (applyError)
-                            console.error('[PersistDisplays] ApplyMonitorsConfig error:', applyError);
-                        finish();
-                    }
-                );
-            } catch (e) {
-                console.error('[PersistDisplays] ApplyMonitorsConfig error:', e);
-                finish();
+            const currentPrimaryConnector = primaryMonitorConnector(logicalMonitors);
+            const targetPrimaryIndex = primary.findIndex(Boolean);
+            const targetPrimaryLM = targetPrimaryIndex >= 0 ? newLogicalMonitors[targetPrimaryIndex] : null;
+            const targetPrimaryConnector = targetPrimaryLM ? primaryMonitorConnector([targetPrimaryLM]) : null;
+
+            const mustTransitionPrimary = newLogicalMonitors.length > 1 &&
+                (hasMultiplePrimaries(logicalMonitors) ||
+                 (currentPrimaryConnector && targetPrimaryConnector &&
+                  currentPrimaryConnector !== targetPrimaryConnector));
+
+            const applyFullConfig = (configSerial) => {
+                if (!this._enabled || proxy !== this._proxy ||
+                    generation !== this._generation ||
+                    restoreGeneration !== this._restoreGeneration) {
+                    finish();
+                    return;
+                }
+                try {
+                    proxy.ApplyMonitorsConfigRemote(
+                        configSerial,
+                        TEMPORARY_CONFIG,
+                        newLogicalMonitors,
+                        applyProperties,
+                        (_result, applyError) => {
+                            if (applyError)
+                                console.error('[PersistDisplays] ApplyMonitorsConfig error:', applyError);
+                            finish();
+                        }
+                    );
+                } catch (e) {
+                    console.error('[PersistDisplays] ApplyMonitorsConfig error:', e);
+                    finish();
+                }
+            };
+
+            if (mustTransitionPrimary && targetPrimaryLM) {
+                // In Mutter 50 (upstream issue #4955), changing which monitor is primary
+                // without destroying the previous primary's logical monitor leaves is_primary
+                // set on both monitors, breaking workspace switching on secondary displays.
+                // Transitioning through a single-monitor layout of the target primary forces
+                // Mutter to cleanly reconstruct the non-primary logical monitors.
+                const singlePrimaryLM = [
+                    [0, 0, targetPrimaryLM[2], targetPrimaryLM[3], true, targetPrimaryLM[5]],
+                ];
+                try {
+                    proxy.ApplyMonitorsConfigRemote(
+                        serial,
+                        TEMPORARY_CONFIG,
+                        singlePrimaryLM,
+                        applyProperties,
+                        (_stepResult, stepError) => {
+                            if (stepError) {
+                                console.error('[PersistDisplays] Primary transition error:', stepError);
+                                finish();
+                                return;
+                            }
+                            if (!this._enabled || proxy !== this._proxy ||
+                                generation !== this._generation ||
+                                restoreGeneration !== this._restoreGeneration) {
+                                finish();
+                                return;
+                            }
+                            proxy.GetCurrentStateRemote((stateResult, stateError) => {
+                                if (stateError || !stateResult ||
+                                    !this._enabled || proxy !== this._proxy ||
+                                    generation !== this._generation ||
+                                    restoreGeneration !== this._restoreGeneration) {
+                                    finish();
+                                    return;
+                                }
+                                const [newSerial] = stateResult;
+                                applyFullConfig(newSerial);
+                            });
+                        }
+                    );
+                } catch (e) {
+                    console.error('[PersistDisplays] Primary transition apply error:', e);
+                    finish();
+                }
+            } else {
+                applyFullConfig(serial);
             }
         });
     }
@@ -559,6 +632,7 @@ export default class PersistDisplaysExtension extends Extension {
         this._enabled = false;
         this._generation++;
         this._restoreGeneration++;
+        this._snapshotGeneration++;
 
         for (const property of [
             '_restoreSourceId',
@@ -572,7 +646,7 @@ export default class PersistDisplaysExtension extends Extension {
         }
 
         const prototype = SwitchMonitor.SwitchMonitorPopup.prototype;
-        if (prototype._finish === this._finishWrapper)
+        if (prototype && prototype._finish === this._finishWrapper)
             prototype._finish = this._originalFinish;
 
         if (this._signalId && this._proxy) {
@@ -586,7 +660,6 @@ export default class PersistDisplaysExtension extends Extension {
         this._pendingRestoreType = null;
         this._snapshotInFlight = false;
         this._snapshotAgain = false;
-        this._snapshotGeneration++;
         this._suppressSnapshot = false;
         this._finishWrapper = null;
         this._originalFinish = null;

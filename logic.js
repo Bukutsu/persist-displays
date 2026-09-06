@@ -110,3 +110,32 @@ export function normalizeLayout(entries, layoutMode) {
     }
     return result;
 }
+
+export function primaryMonitorConnector(logicalMonitors) {
+    if (!Array.isArray(logicalMonitors))
+        return null;
+
+    for (const logicalMonitor of logicalMonitors) {
+        if (!Array.isArray(logicalMonitor))
+            continue;
+        const isPrimary = logicalMonitor[4];
+        const monitorSpecs = logicalMonitor[5];
+        if (isPrimary && Array.isArray(monitorSpecs) && monitorSpecs.length > 0) {
+            const first = monitorSpecs[0];
+            return Array.isArray(first) ? first[0] : first;
+        }
+    }
+    return null;
+}
+
+export function hasMultiplePrimaries(logicalMonitors) {
+    if (!Array.isArray(logicalMonitors))
+        return false;
+    let count = 0;
+    for (const logicalMonitor of logicalMonitors) {
+        if (Array.isArray(logicalMonitor) && logicalMonitor[4])
+            count++;
+    }
+    return count > 1;
+}
+

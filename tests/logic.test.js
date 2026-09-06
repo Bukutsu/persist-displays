@@ -1,7 +1,9 @@
 import {
+    hasMultiplePrimaries,
     monitorApplyProperties,
     normalizeLayout,
     normalizePrimary,
+    primaryMonitorConnector,
     profileMatchesMonitor,
     scaleSupported,
 } from '../logic.js';
@@ -53,5 +55,22 @@ assertEqual(normalizeLayout([
     { x: 0, y: 0, scale: 2, transform: 0, mode },
     { x: 960, y: 0, scale: 1, transform: 1, mode },
 ], 1), [{ x: 0, y: 0 }, { x: 960, y: 0 }], 'uses logical transformed dimensions');
+
+const dualLMs = [
+    [0, 0, 1.5, 0, false, [['eDP-1', 'mode', {}]]],
+    [1920, 0, 1, 0, true, [['HDMI-1', 'mode', {}]]],
+];
+assertEqual(primaryMonitorConnector(dualLMs), 'HDMI-1', 'identifies primary connector');
+assertEqual(hasMultiplePrimaries(dualLMs), false, 'detects single primary');
+
+const buggyLMs = [
+    [0, 0, 1.5, 0, true, [['eDP-1', 'mode', {}]]],
+    [1920, 0, 1, 0, true, [['HDMI-1', 'mode', {}]]],
+];
+assertEqual(primaryMonitorConnector(buggyLMs), 'eDP-1', 'returns first primary connector');
+assertEqual(hasMultiplePrimaries(buggyLMs), true, 'detects duplicate primaries');
+
+assertEqual(primaryMonitorConnector([]), null, 'handles empty monitors');
+assertEqual(hasMultiplePrimaries([]), false, 'handles empty monitors for multiple primaries');
 
 print('logic tests passed');
