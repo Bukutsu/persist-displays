@@ -1,36 +1,33 @@
 # Persist Displays
 
-Persist Displays remembers monitor modes, scale, rotation, and layout when you use GNOME's `Super+P` display switcher. It currently supports GNOME Shell 50.
+Persist Displays keeps monitor modes, scale, rotation, and layout when you switch displays with GNOME's `Super+P` menu. GNOME Shell rebuilds the layout when you select a mode, so the extension saves the current display settings and reapplies them after the switch. It has no panel UI.
 
-GNOME rebuilds the layout when the switcher changes modes. This extension records the current settings and reapplies them after Mutter switches the layout. It has no panel UI.
+This works around [Mutter issue #326: switching display modes resets configuration](https://gitlab.gnome.org/GNOME/mutter/-/work_items/326). It restores saved settings when returning to an extended layout or selecting a single display, while leaving mirror mode to GNOME.
 
-## Files
+The extension supports GNOME Shell 50 and 51.
 
-- `extension.js` contains the GNOME Shell integration.
-- `logic.js` contains independently testable configuration helpers.
-- `metadata.json` contains the GNOME Shell metadata.
+## Install
 
-## Install from a checkout
+From the project directory, build and install the extension package:
 
-```bash
-mkdir -p ~/.local/share/gnome-shell/extensions/
-ln -s ~/Projects/persist-displays ~/.local/share/gnome-shell/extensions/persist-displays@bukutsu.github.io
+```sh
+gnome-extensions pack --force --extra-source=logic.js --extra-source=LICENSE .
+gnome-extensions install --force persist-displays@bukutsu.github.io.shell-extension.zip
 ```
 
-Log out and back in so GNOME Shell discovers the extension, then enable it:
+Log out and back in, then enable the extension:
 
-```bash
+```sh
 gnome-extensions enable persist-displays@bukutsu.github.io
 ```
 
+To update an existing installation, repeat the package and install commands, then restart GNOME Shell by logging out and back in. On Wayland, logging out is required; on X11, you can restart Shell with `Alt+F2`, then `r`.
+
 ## Test
 
-```bash
+Run the tests from the project directory:
+
+```sh
 gjs -m tests/logic.test.js
-```
-
-## Package
-
-```bash
-gnome-extensions pack --extra-source=logic.js --extra-source=LICENSE .
+gjs -m tests/extension.test.js
 ```

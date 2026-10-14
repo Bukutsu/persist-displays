@@ -54,6 +54,9 @@ export default class PersistDisplaysExtension extends Extension {
             'persist-displays.json',
         ]);
         this._memory = this._loadMemory();
+        this._savedMemory = JSON.stringify(this._memory);
+        this._switchTimeoutId = 0;
+        this._restoreReady = false;
         this._suppressSnapshot = false;
         this._restoreSourceId = 0;
         this._restoreInFlight = false;
@@ -80,8 +83,12 @@ export default class PersistDisplaysExtension extends Extension {
 
                 this._proxy = proxy;
                 this._signalId = proxy.connectSignal('MonitorsChanged', () => {
-                    if (!this._suppressSnapshot)
+                    if (this._pendingRestoreType !== null) {
+                        this._restoreReady = true;
+                        this._queueRestore();
+                    } else if (!this._suppressSnapshot) {
                         this._queueSnapshot();
+                    }
                 });
                 this._queueSnapshot();
             }
@@ -101,15 +108,8 @@ export default class PersistDisplaysExtension extends Extension {
             const configType = item && item.configType;
 
             if (extension._shouldRestore(configType)) {
-                // _finish() queues Mutter's switch_config() on an idle source.
-                // Queue ours afterwards so it amends the configuration Mutter
-                // just selected, rather than being overwritten by it.
-                extension._suppressSnapshot = true;
-                try {
-                    originalFinish.call(this);
-                } finally {
-                    extension._queueRestore(configType);
-                }
+                extension._waitForSwitch(configType);
+                originalFinish.call(this);
                 return;
             }
 
@@ -141,6 +141,11 @@ export default class PersistDisplaysExtension extends Extension {
             this._restoreSourceId = 0;
         }
 
+        if (this._switchTimeoutId) {
+            GLib.source_remove(this._switchTimeoutId);
+            this._switchTimeoutId = 0;
+        }
+        this._restoreReady = false;
         this._suppressSnapshot = true;
         this._pendingRestoreType = null;
         this._restoreGeneration++;
@@ -157,20 +162,45 @@ export default class PersistDisplaysExtension extends Extension {
         );
     }
 
-    _queueRestore(configType) {
+    _waitForSwitch(configType) {
         if (this._ignoreSnapshotSourceId) {
             GLib.source_remove(this._ignoreSnapshotSourceId);
             this._ignoreSnapshotSourceId = 0;
         }
 
+        if (this._switchTimeoutId)
+            GLib.source_remove(this._switchTimeoutId);
+        this._suppressSnapshot = true;
+        this._snapshotGeneration++;
+        this._snapshotAgain = false;
         this._pendingRestoreType = configType;
+        this._restoreReady = false;
         this._restoreGeneration++;
-        if (this._restoreSourceId || this._restoreInFlight)
+        // A no-op switch may emit no signal. Leave GNOME's configuration alone.
+        this._switchTimeoutId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 2000, () => {
+            this._switchTimeoutId = 0;
+            this._pendingRestoreType = null;
+            this._restoreReady = false;
+            this._restoreGeneration++;
+            this._suppressSnapshot = false;
+            return GLib.SOURCE_REMOVE;
+        });
+    }
+
+    _queueRestore() {
+        if (!this._restoreReady || this._restoreSourceId || this._restoreInFlight)
             return;
 
         const generation = this._generation;
         this._restoreSourceId = GLib.idle_add(GLib.PRIORITY_LOW, () => {
             this._restoreSourceId = 0;
+            if (!this._restoreReady || this._pendingRestoreType === null)
+                return GLib.SOURCE_REMOVE;
+            if (this._switchTimeoutId) {
+                GLib.source_remove(this._switchTimeoutId);
+                this._switchTimeoutId = 0;
+            }
+            this._restoreReady = false;
             const pendingType = this._pendingRestoreType;
             const restoreGeneration = this._restoreGeneration;
             this._pendingRestoreType = null;
@@ -181,7 +211,7 @@ export default class PersistDisplaysExtension extends Extension {
 
                 this._restoreInFlight = false;
                 if (this._pendingRestoreType !== null)
-                    this._queueRestore(this._pendingRestoreType);
+                    this._queueRestore();
                 else if (restoreGeneration === this._restoreGeneration)
                     this._suppressSnapshot = false;
             }, restoreGeneration);
@@ -207,8 +237,12 @@ export default class PersistDisplaysExtension extends Extension {
 
     _saveMemory() {
         try {
-            const data = new TextEncoder().encode(JSON.stringify(this._memory, null, 2));
-            GLib.file_set_contents(this._configFile, data);
+            const serialized = JSON.stringify(this._memory);
+            if (serialized === this._savedMemory)
+                return;
+            const data = new TextEncoder().encode(serialized);
+            if (GLib.file_set_contents(this._configFile, data))
+                this._savedMemory = serialized;
         } catch (e) {
             console.error('[PersistDisplays] Failed to save memory:', e);
         }
@@ -514,11 +548,6 @@ export default class PersistDisplaysExtension extends Extension {
                 }
             }
 
-            if (!changed) {
-                finish();
-                return;
-            }
-
             const positions = normalizeLayout(entries, layoutMode);
             const primary = normalizePrimary(entries.map(entry => entry.primary));
             const newLogicalMonitors = entries.map((entry, index) => [
@@ -529,6 +558,14 @@ export default class PersistDisplaysExtension extends Extension {
                 primary[index],
                 entry.monitors,
             ]);
+
+            // Compare final positions and primary flags, including repairs.
+            changed ||= newLogicalMonitors.some((lm, index) =>
+                lm.slice(0, 5).some((value, field) => value !== logicalMonitors[index][field]));
+            if (!changed) {
+                finish();
+                return;
+            }
 
             const applyProperties = {};
             if (supportsLayoutMode && [1, 2].includes(layoutMode))
@@ -553,6 +590,56 @@ export default class PersistDisplaysExtension extends Extension {
                  (currentPrimaryConnector && targetPrimaryConnector &&
                   currentPrimaryConnector !== targetPrimaryConnector));
 
+            let transitioned = false;
+            const recoveryFailed = error => {
+                console.error('[PersistDisplays] Recovery error:', error);
+                finish();
+            };
+            const recover = () => {
+                // Do not overwrite a newer switch or a configuration after disable.
+                if (!transitioned || !this._enabled || proxy !== this._proxy ||
+                    generation !== this._generation ||
+                    restoreGeneration !== this._restoreGeneration) {
+                    finish();
+                    return;
+                }
+                try {
+                    proxy.GetCurrentStateRemote((state, error) => {
+                        try {
+                            if (error || !state || !this._enabled || proxy !== this._proxy ||
+                                generation !== this._generation ||
+                                restoreGeneration !== this._restoreGeneration) {
+                                if (error)
+                                    console.error('[PersistDisplays] Recovery state error:', error);
+                                finish();
+                                return;
+                            }
+                            const original = logicalMonitors.map(lm => [
+                                ...lm.slice(0, 5),
+                                lm[5].map(spec => {
+                                    const monitor = monitorMap.get(spec[0]);
+                                    return [spec[0], this._currentMode(monitor)[0],
+                                        monitorApplyProperties(monitor?.[2])];
+                                }),
+                            ]);
+                            const originalProperties = { ...applyProperties };
+                            if (supportsLayoutMode && [1, 2].includes(currentLayoutMode))
+                                originalProperties['layout-mode'] = new GLib.Variant('u', currentLayoutMode);
+                            proxy.ApplyMonitorsConfigRemote(state[0], TEMPORARY_CONFIG,
+                                original, originalProperties, (_result, recoveryError) => {
+                                    if (recoveryError)
+                                        console.error('[PersistDisplays] Recovery apply error:', recoveryError);
+                                    finish();
+                                });
+                        } catch (e) {
+                            recoveryFailed(e);
+                        }
+                    });
+                } catch (e) {
+                    recoveryFailed(e);
+                }
+            };
+
             const applyFullConfig = (configSerial) => {
                 if (!this._enabled || proxy !== this._proxy ||
                     generation !== this._generation ||
@@ -567,14 +654,17 @@ export default class PersistDisplaysExtension extends Extension {
                         newLogicalMonitors,
                         applyProperties,
                         (_result, applyError) => {
-                            if (applyError)
+                            if (applyError) {
                                 console.error('[PersistDisplays] ApplyMonitorsConfig error:', applyError);
-                            finish();
+                                recover();
+                            } else {
+                                finish();
+                            }
                         }
                     );
                 } catch (e) {
                     console.error('[PersistDisplays] ApplyMonitorsConfig error:', e);
-                    finish();
+                    recover();
                 }
             };
 
@@ -605,12 +695,13 @@ export default class PersistDisplaysExtension extends Extension {
                                 finish();
                                 return;
                             }
+                            transitioned = true;
                             proxy.GetCurrentStateRemote((stateResult, stateError) => {
                                 if (stateError || !stateResult ||
                                     !this._enabled || proxy !== this._proxy ||
                                     generation !== this._generation ||
                                     restoreGeneration !== this._restoreGeneration) {
-                                    finish();
+                                    recover();
                                     return;
                                 }
                                 const [newSerial] = stateResult;
@@ -635,6 +726,7 @@ export default class PersistDisplaysExtension extends Extension {
         this._snapshotGeneration++;
 
         for (const property of [
+            '_switchTimeoutId',
             '_restoreSourceId',
             '_snapshotSourceId',
             '_ignoreSnapshotSourceId',
